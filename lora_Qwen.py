@@ -1,33 +1,42 @@
 from __future__ import annotations
 
 """
-LoRa_hf_qwen_lora.py
+LoRa_hf_qwen_lora_server.py
 
-Hugging Face pretrained LLM + PEFT-LoRA version for echo-to-channel prediction.
+Server-friendly Hugging Face pretrained LLM + PEFT-LoRA version for
+echo-to-channel prediction.
 
 Main idea:
     complex echo history -> CNN echo encoder -> inputs_embeds of a pretrained HF LLM
     -> LoRA-adapted attention layers -> regression head -> future Willie channel.
 
-This is different from the previous local GPT-style model:
-    previous: local randomly initialized GPT-style backbone
-    this:     pretrained Hugging Face LLM backbone + PEFT LoRA adapters
+This server version additionally saves:
+    output_dir/
+        config.json
+        environment.json
+        train_log.csv
+        val_predictions.csv
+        val_metrics.csv
+        summary.json
+        best_model.pt
 
-Recommended first base model:
-    Qwen/Qwen2.5-0.5B
-
-Before running:
-    pip install transformers peft accelerate safetensors
+These files are designed for easy download from a server, so the training
+performance can be analyzed without relying only on terminal logs.
 """
 
 
 
+
 import argparse
+import csv
 import json
 import math
 import os
+import time
+from datetime import datetime
+from pathlib import Path
 from dataclasses import asdict, dataclass
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple, Dict, Any
 
 import numpy as np
 import torch
@@ -76,6 +85,7 @@ class EchoLoRAConfig:
     hf_target_modules: str = "q_proj,v_proj"
     hf_trust_remote_code: bool = True
     hf_freeze_base: bool = True
+    hf_cache_dir: Optional[str] = None
 
     # Channel model used for labels h_w = sqrt(L0 r^-alpha_w) a(theta).
     L0: float = 1e-3
@@ -94,7 +104,8 @@ class EchoLoRAConfig:
     lora_dropout: float = 0.08
 
     # Training.
-    batch_size: int = 8
+    batch_size: int = 4
+    grad_accum_steps: int = 1
     epochs: int = 50
     lr: float = 2e-5
     weight_decay: float = 3e-4
@@ -108,6 +119,11 @@ class EchoLoRAConfig:
     early_stop_patience: int = 20
     early_stop_min_delta: float = 1e-5
     split_by_order: bool = True  # True: last 20% windows/trajectories as validation.
+
+    # Server output.
+    output_dir: str = "runs/hf_qwen_lora_server"
+    val_pred_samples: int = 128
+    save_val_predictions: bool = True
 
 
 # =============================================================================
@@ -537,6 +553,7 @@ class EchoToChannelHFLoRA(nn.Module):
         hf_config = AutoConfig.from_pretrained(
             cfg.hf_model_name,
             trust_remote_code=cfg.hf_trust_remote_code,
+            cache_dir=cfg.hf_cache_dir,
         )
         hidden_size = int(getattr(hf_config, "hidden_size"))
         self.hidden_size = hidden_size
@@ -547,6 +564,7 @@ class EchoToChannelHFLoRA(nn.Module):
             cfg.hf_model_name,
             torch_dtype=dtype,
             trust_remote_code=cfg.hf_trust_remote_code,
+            cache_dir=cfg.hf_cache_dir,
             low_cpu_mem_usage=True,
         )
 
@@ -686,28 +704,226 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> floa
     return float(np.mean(vals)) if vals else float("nan")
 
 
+
+def _to_jsonable(obj):
+    """Convert numpy/torch objects to JSON-serializable objects."""
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if torch.is_tensor(obj):
+        return obj.detach().cpu().tolist()
+    if isinstance(obj, Path):
+        return str(obj)
+    return obj
+
+
+def save_json(path: Path, data: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False, default=_to_jsonable)
+
+
+def append_csv_row(path: Path, row: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    exists = path.exists()
+    with open(path, "a", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def write_csv_rows(path: Path, rows) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = list(rows)
+    if not rows:
+        return
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def get_environment_info(device: torch.device) -> Dict[str, Any]:
+    info = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "python": os.sys.version,
+        "torch_version": torch.__version__,
+        "torch_cuda_available": bool(torch.cuda.is_available()),
+        "torch_cuda_version": torch.version.cuda,
+        "selected_device": str(device),
+        "cuda_device_count": int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
+        "cuda_device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+    }
+    try:
+        import transformers
+        info["transformers_version"] = transformers.__version__
+    except Exception:
+        info["transformers_version"] = None
+    try:
+        import peft
+        info["peft_version"] = peft.__version__
+    except Exception:
+        info["peft_version"] = None
+    return info
+
+
+def channel_nmse_np(pred_c: np.ndarray, true_c: np.ndarray, eps: float = 1e-12) -> float:
+    num = float(np.sum(np.abs(pred_c - true_c) ** 2))
+    den = float(np.sum(np.abs(true_c) ** 2)) + eps
+    return num / den
+
+
+@torch.no_grad()
+def export_validation_predictions(
+    model: nn.Module,
+    X_val_n: np.ndarray,
+    Y_val_n: np.ndarray,
+    y_scaler: StandardScaler,
+    cfg: EchoLoRAConfig,
+    device: torch.device,
+    out_csv: Path,
+    metrics_csv: Path,
+    max_samples: int = 128,
+    batch_size: int = 4,
+    val_indices: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    """
+    Export validation prediction details to CSV.
+
+    CSV granularity:
+        one row = one validation sample at one prediction horizon.
+    """
+    model.eval()
+    n_val = int(X_val_n.shape[0])
+    if max_samples is None or max_samples <= 0 or max_samples >= n_val:
+        selected = np.arange(n_val)
+    else:
+        selected = np.linspace(0, n_val - 1, int(max_samples), dtype=int)
+        selected = np.unique(selected)
+
+    pred_batches = []
+    for start in range(0, len(selected), batch_size):
+        ids = selected[start:start + batch_size]
+        xb = torch.as_tensor(X_val_n[ids], dtype=torch.float32, device=device)
+        pred_n = model(xb).detach().cpu().numpy()
+        pred_batches.append(pred_n)
+
+    pred_n_all = np.concatenate(pred_batches, axis=0)
+    true_n_all = Y_val_n[selected]
+
+    pred_ri = y_scaler.inverse_transform(pred_n_all)
+    true_ri = y_scaler.inverse_transform(true_n_all)
+
+    rows = []
+    channel_nmse_vals = []
+    range_err_vals = []
+    angle_err_vals = []
+
+    for local_i, original_val_pos in enumerate(selected):
+        sample_index = int(val_indices[original_val_pos]) if val_indices is not None else int(original_val_pos)
+        for h in range(cfg.pred_len):
+            pred_c = ri_to_complex(pred_ri[local_i, h])
+            true_c = ri_to_complex(true_ri[local_i, h])
+
+            pred_r, pred_th = channel_to_range_angle(pred_c, L0=cfg.L0, alpha_w=cfg.alpha_w)
+            true_r, true_th = channel_to_range_angle(true_c, L0=cfg.L0, alpha_w=cfg.alpha_w)
+
+            nmse = channel_nmse_np(pred_c, true_c)
+            range_abs_err = abs(pred_r - true_r)
+            angle_abs_err_deg = abs(float(wrap_angle_rad(pred_th - true_th))) * 180.0 / np.pi
+
+            channel_nmse_vals.append(nmse)
+            range_err_vals.append(range_abs_err)
+            angle_err_vals.append(angle_abs_err_deg)
+
+            rows.append({
+                "sample_index": sample_index,
+                "val_position": int(original_val_pos),
+                "horizon": int(h + 1),
+                "true_range_m": true_r,
+                "pred_range_m": pred_r,
+                "range_abs_err_m": range_abs_err,
+                "true_angle_deg": true_th * 180.0 / np.pi,
+                "pred_angle_deg": pred_th * 180.0 / np.pi,
+                "angle_abs_err_deg": angle_abs_err_deg,
+                "channel_nmse": nmse,
+            })
+
+    write_csv_rows(out_csv, rows)
+
+    def _stats(x):
+        x = np.asarray(x, dtype=float)
+        return {
+            "mean": float(np.mean(x)),
+            "median": float(np.median(x)),
+            "std": float(np.std(x)),
+            "min": float(np.min(x)),
+            "max": float(np.max(x)),
+        }
+
+    metrics = {
+        "num_validation_samples_total": n_val,
+        "num_exported_samples": int(len(selected)),
+        "num_exported_rows": int(len(rows)),
+        "channel_nmse_mean": _stats(channel_nmse_vals)["mean"],
+        "channel_nmse_median": _stats(channel_nmse_vals)["median"],
+        "channel_nmse_std": _stats(channel_nmse_vals)["std"],
+        "range_mae_m": float(np.mean(range_err_vals)),
+        "range_median_abs_err_m": float(np.median(range_err_vals)),
+        "angle_mae_deg": float(np.mean(angle_err_vals)),
+        "angle_median_abs_err_deg": float(np.median(angle_err_vals)),
+        "channel_nmse_min": float(np.min(channel_nmse_vals)),
+        "channel_nmse_max": float(np.max(channel_nmse_vals)),
+    }
+    write_csv_rows(metrics_csv, [metrics])
+    return metrics
+
+
 def train_echo_to_channel_lora(
     X: np.ndarray,
     Y: np.ndarray,
     cfg: EchoLoRAConfig,
-    save_path: str = "lora_echo_to_channel.pt",
+    save_path: str = "best_model.pt",
     device: Optional[str] = None,
+    output_dir: Optional[str] = None,
+    val_pred_samples: Optional[int] = None,
+    save_val_predictions: Optional[bool] = None,
 ) -> dict:
     set_seed(cfg.seed)
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+
+    out_dir = Path(output_dir or cfg.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    save_path_obj = Path(save_path)
+    if not save_path_obj.is_absolute() and str(save_path_obj.parent) == ".":
+        save_path_obj = out_dir / save_path_obj.name
+    save_path = str(save_path_obj)
+
+    train_log_csv = out_dir / "train_log.csv"
+    val_pred_csv = out_dir / "val_predictions.csv"
+    val_metrics_csv = out_dir / "val_metrics.csv"
+    config_json = out_dir / "config.json"
+    summary_json = out_dir / "summary.json"
+    env_json = out_dir / "environment.json"
+
     X = np.asarray(X, dtype=np.float32)
     Y = np.asarray(Y, dtype=np.float32)
 
     cfg.echo_dim = int(X.shape[2])
     cfg.L_snap = int(X.shape[3])
     cfg.L_ris = int(Y.shape[2])
+    cfg.output_dir = str(out_dir)
+    cfg.val_pred_samples = int(val_pred_samples if val_pred_samples is not None else cfg.val_pred_samples)
+    cfg.save_val_predictions = bool(save_val_predictions if save_val_predictions is not None else cfg.save_val_predictions)
 
     n = X.shape[0]
     n_val = max(1, int(n * cfg.val_ratio))
     if cfg.split_by_order:
-        # Because generate_training_dataset_by_music concatenates trajectories in
-        # order, this usually means the last group of trajectories is reserved for
-        # validation. This is safer than random adjacent-window leakage.
         train_idx = np.arange(0, n - n_val)
         val_idx = np.arange(n - n_val, n)
     else:
@@ -741,8 +957,41 @@ def train_echo_to_channel_lora(
     model = EchoToChannelLoRAGPT(cfg)
     freeze_backbone_except_lora_and_io(model)
     model.to(dev)
+
     total, trainable = count_params(model)
+
+    env_info = get_environment_info(dev)
+    save_json(env_json, env_info)
+
+    config_payload = {
+        "config": asdict(cfg),
+        "dataset": {
+            "X_shape": list(X.shape),
+            "Y_shape": list(Y.shape),
+            "train_size": int(len(train_idx)),
+            "val_size": int(len(val_idx)),
+            "split_mode": "order/trajectory-like" if cfg.split_by_order else "random sample",
+        },
+        "model": {
+            "total_params": int(total),
+            "trainable_params": int(trainable),
+            "trainable_ratio_percent": float(100 * trainable / max(total, 1)),
+        },
+        "paths": {
+            "output_dir": str(out_dir),
+            "checkpoint": save_path,
+            "train_log_csv": str(train_log_csv),
+            "val_predictions_csv": str(val_pred_csv),
+            "val_metrics_csv": str(val_metrics_csv),
+            "summary_json": str(summary_json),
+            "environment_json": str(env_json),
+        },
+    }
+    save_json(config_json, config_payload)
+
     print(f"Device: {dev}")
+    print(f"Output dir: {out_dir}")
+    print(f"Checkpoint: {save_path}")
     print(f"Dataset: train={len(train_idx)}, val={len(val_idx)}, X={X.shape}, Y={Y.shape}")
     print(f"Split mode: {'order/trajectory-like' if cfg.split_by_order else 'random sample'}")
     print(f"Parameters: total={total:,}, trainable={trainable:,} ({100*trainable/total:.2f}%)")
@@ -758,29 +1007,47 @@ def train_echo_to_channel_lora(
         factor=0.5,
         patience=max(2, cfg.early_stop_patience // 2),
     )
+
     best_val, best_epoch = float("inf"), -1
     bad_epochs = 0
+    train_start_time = time.time()
+
+    # Start a fresh log file for this run.
+    if train_log_csv.exists():
+        train_log_csv.unlink()
 
     for ep in range(1, cfg.epochs + 1):
+        epoch_start_time = time.time()
         model.train()
         losses = []
-        for xb, yb in train_loader:
+        opt.zero_grad(set_to_none=True)
+
+        if dev.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(dev)
+
+        for step, (xb, yb) in enumerate(train_loader, start=1):
             xb, yb = xb.to(dev), yb.to(dev)
             if cfg.input_noise_std > 0:
                 xb_model = xb + cfg.input_noise_std * torch.randn_like(xb)
             else:
                 xb_model = xb
+
             pred = model(xb_model)
-            loss = channel_nmse_loss(pred, yb)
-            opt.zero_grad(set_to_none=True)
+            raw_loss = channel_nmse_loss(pred, yb)
+            loss = raw_loss / max(1, int(cfg.grad_accum_steps))
             loss.backward()
-            if cfg.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in model.parameters() if p.requires_grad],
-                    cfg.grad_clip,
-                )
-            opt.step()
-            losses.append(float(loss.item()))
+
+            should_step = (step % max(1, int(cfg.grad_accum_steps)) == 0) or (step == len(train_loader))
+            if should_step:
+                if cfg.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in model.parameters() if p.requires_grad],
+                        cfg.grad_clip,
+                    )
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+
+            losses.append(float(raw_loss.item()))
 
         val = evaluate(model, val_loader, dev)
         sched.step(val)
@@ -802,11 +1069,31 @@ def train_echo_to_channel_lora(
         else:
             bad_epochs += 1
 
+        epoch_seconds = time.time() - epoch_start_time
+        peak_cuda_mem_gb = None
+        if dev.type == "cuda":
+            peak_cuda_mem_gb = float(torch.cuda.max_memory_allocated(dev) / (1024 ** 3))
+
+        log_row = {
+            "epoch": ep,
+            "train_nmse": tr,
+            "val_nmse": val,
+            "best_val_nmse": best_val,
+            "best_epoch": best_epoch,
+            "lr": current_lr,
+            "bad_epochs": bad_epochs,
+            "epoch_seconds": epoch_seconds,
+            "peak_cuda_mem_gb": peak_cuda_mem_gb,
+            "improved": int(improved),
+        }
+        append_csv_row(train_log_csv, log_row)
+
         if ep == 1 or ep % 5 == 0 or ep == cfg.epochs or improved:
             print(
                 f"Epoch {ep:04d}/{cfg.epochs} | "
                 f"train_NMSE={tr:.6e} | val_NMSE={val:.6e} | "
-                f"best={best_val:.6e}@{best_epoch} | lr={current_lr:.2e} | bad={bad_epochs}"
+                f"best={best_val:.6e}@{best_epoch} | lr={current_lr:.2e} | "
+                f"bad={bad_epochs} | sec={epoch_seconds:.1f}"
             )
 
         if cfg.early_stop_patience > 0 and bad_epochs >= cfg.early_stop_patience:
@@ -816,13 +1103,48 @@ def train_echo_to_channel_lora(
             )
             break
 
-    return {
+    total_seconds = time.time() - train_start_time
+
+    val_prediction_metrics = None
+    if cfg.save_val_predictions and Path(save_path).exists():
+        print("Exporting validation predictions to CSV...")
+        ckpt = torch.load(save_path, map_location=dev)
+        missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        if unexpected:
+            print("Unexpected keys when reloading best checkpoint:", unexpected)
+        model.to(dev)
+        model.eval()
+        val_prediction_metrics = export_validation_predictions(
+            model=model,
+            X_val_n=X_val,
+            Y_val_n=Y_val,
+            y_scaler=y_scaler,
+            cfg=cfg,
+            device=dev,
+            out_csv=val_pred_csv,
+            metrics_csv=val_metrics_csv,
+            max_samples=cfg.val_pred_samples,
+            batch_size=cfg.batch_size,
+            val_indices=val_idx,
+        )
+        print(f"Validation prediction CSV saved to: {val_pred_csv}")
+        print(f"Validation metrics CSV saved to: {val_metrics_csv}")
+
+    summary = {
         "save_path": save_path,
+        "output_dir": str(out_dir),
         "best_val_nmse": best_val,
         "best_epoch": best_epoch,
         "total_params": total,
         "trainable_params": trainable,
+        "total_seconds": total_seconds,
+        "train_log_csv": str(train_log_csv),
+        "val_predictions_csv": str(val_pred_csv) if cfg.save_val_predictions else None,
+        "val_metrics_csv": str(val_metrics_csv) if cfg.save_val_predictions else None,
+        "validation_prediction_metrics": val_prediction_metrics,
     }
+    save_json(summary_json, summary)
+    return summary
 
 
 def load_trained_echo_lora(checkpoint_path: str, device: Optional[str] = None):
@@ -876,7 +1198,7 @@ def main():
     parser = argparse.ArgumentParser(description="HF pretrained LLM + PEFT-LoRA echo-to-channel predictor for Willie CSI.")
     parser.add_argument("--mode", type=str, default="train", choices=["train", "infer_demo"])
     parser.add_argument("--data_npz", type=str, default=None, help="Optional .npz with echo_seq/h_seq or X/Y.")
-    parser.add_argument("--save_path", type=str, default="lora_echo_to_channel_hf_qwen.pt")
+    parser.add_argument("--save_path", type=str, default="best_model.pt")
     parser.add_argument("--input_len", type=int, default=5)
     parser.add_argument("--pred_len", type=int, default=5)
     parser.add_argument("--num_traj", type=int, default=80)
@@ -884,7 +1206,11 @@ def main():
     parser.add_argument("--label_mode", type=str, default="true", choices=["true", "music"])
     parser.add_argument("--music_grid_small", action="store_true")
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--grad_accum_steps", type=int, default=1)
+    parser.add_argument("--output_dir", type=str, default="runs/hf_qwen_lora_server")
+    parser.add_argument("--val_pred_samples", type=int, default=128)
+    parser.add_argument("--no_save_val_predictions", action="store_true")
     parser.add_argument("--d_model", type=int, default=96)
     parser.add_argument("--n_heads", type=int, default=4)
     parser.add_argument("--n_layers", type=int, default=2)
@@ -904,6 +1230,7 @@ def main():
     parser.add_argument("--music_L_ris", type=int, default=12)
     parser.add_argument("--music_SNR_dB", type=float, default=10.0)
     parser.add_argument("--hf_model_name", type=str, default="Qwen/Qwen2.5-0.5B")
+    parser.add_argument("--hf_cache_dir", type=str, default=None)
     parser.add_argument("--hf_dtype", type=str, default="float16", choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--hf_target_modules", type=str, default="q_proj,v_proj")
     parser.add_argument("--no_hf_trust_remote_code", action="store_true")
@@ -916,6 +1243,10 @@ def main():
         pred_len=args.pred_len,
         epochs=args.epochs,
         batch_size=args.batch_size,
+        grad_accum_steps=args.grad_accum_steps,
+        output_dir=args.output_dir,
+        val_pred_samples=args.val_pred_samples,
+        save_val_predictions=not args.no_save_val_predictions,
         d_model=args.d_model,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
@@ -935,6 +1266,7 @@ def main():
         music_L_ris=args.music_L_ris,
         music_SNR_dB=args.music_SNR_dB,
         hf_model_name=args.hf_model_name,
+        hf_cache_dir=args.hf_cache_dir,
         hf_dtype=args.hf_dtype,
         hf_target_modules=args.hf_target_modules,
         hf_trust_remote_code=not args.no_hf_trust_remote_code,
@@ -953,7 +1285,16 @@ def main():
                 music_grid_small=args.music_grid_small,
             )
         print(f"Dataset ready: X={X.shape}, Y={Y.shape}")
-        info = train_echo_to_channel_lora(X, Y, cfg, save_path=args.save_path, device=args.device)
+        info = train_echo_to_channel_lora(
+            X,
+            Y,
+            cfg,
+            save_path=args.save_path,
+            device=args.device,
+            output_dir=args.output_dir,
+            val_pred_samples=args.val_pred_samples,
+            save_val_predictions=not args.no_save_val_predictions,
+        )
         print("\nTraining finished.")
         print(json.dumps(info, indent=2))
 
