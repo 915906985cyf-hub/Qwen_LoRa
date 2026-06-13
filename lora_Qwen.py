@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 """
-LoRa_hf_qwen_lora_server.py
+LoRa_hf_qwen_lora_server_slim.py
 
 Server-friendly Hugging Face pretrained LLM + PEFT-LoRA version for
 echo-to-channel prediction.
@@ -10,18 +10,16 @@ Main idea:
     complex echo history -> CNN echo encoder -> inputs_embeds of a pretrained HF LLM
     -> LoRA-adapted attention layers -> regression head -> future Willie channel.
 
-This server version additionally saves:
+This slim server version saves only the essential files by default:
     output_dir/
-        config.json
-        environment.json
-        train_log.csv
-        val_predictions.csv
-        val_metrics.csv
-        summary.json
         best_model.pt
+        train_log.csv
+        summary.json
 
-These files are designed for easy download from a server, so the training
-performance can be analyzed without relying only on terminal logs.
+Optional detailed prediction CSV can be enabled with:
+    --save_val_predictions
+
+This is easier for server download and feedback.
 """
 
 
@@ -121,9 +119,9 @@ class EchoLoRAConfig:
     split_by_order: bool = True  # True: last 20% windows/trajectories as validation.
 
     # Server output.
-    output_dir: str = "runs/hf_qwen_lora_server"
+    output_dir: str = "runs/hf_qwen_lora_slim"
     val_pred_samples: int = 128
-    save_val_predictions: bool = True
+    save_val_predictions: bool = False
 
 
 # =============================================================================
@@ -961,7 +959,6 @@ def train_echo_to_channel_lora(
     total, trainable = count_params(model)
 
     env_info = get_environment_info(dev)
-    save_json(env_json, env_info)
 
     config_payload = {
         "config": asdict(cfg),
@@ -977,17 +974,8 @@ def train_echo_to_channel_lora(
             "trainable_params": int(trainable),
             "trainable_ratio_percent": float(100 * trainable / max(total, 1)),
         },
-        "paths": {
-            "output_dir": str(out_dir),
-            "checkpoint": save_path,
-            "train_log_csv": str(train_log_csv),
-            "val_predictions_csv": str(val_pred_csv),
-            "val_metrics_csv": str(val_metrics_csv),
-            "summary_json": str(summary_json),
-            "environment_json": str(env_json),
-        },
+        "environment": env_info,
     }
-    save_json(config_json, config_payload)
 
     print(f"Device: {dev}")
     print(f"Output dir: {out_dir}")
@@ -1133,6 +1121,7 @@ def train_echo_to_channel_lora(
     summary = {
         "save_path": save_path,
         "output_dir": str(out_dir),
+        "config_info": config_payload,
         "best_val_nmse": best_val,
         "best_epoch": best_epoch,
         "total_params": total,
@@ -1208,9 +1197,9 @@ def main():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
-    parser.add_argument("--output_dir", type=str, default="runs/hf_qwen_lora_server")
+    parser.add_argument("--output_dir", type=str, default="runs/hf_qwen_lora_slim")
     parser.add_argument("--val_pred_samples", type=int, default=128)
-    parser.add_argument("--no_save_val_predictions", action="store_true")
+    parser.add_argument("--save_val_predictions", action="store_true", help="Optional: export detailed validation predictions CSV.")
     parser.add_argument("--d_model", type=int, default=96)
     parser.add_argument("--n_heads", type=int, default=4)
     parser.add_argument("--n_layers", type=int, default=2)
@@ -1246,7 +1235,7 @@ def main():
         grad_accum_steps=args.grad_accum_steps,
         output_dir=args.output_dir,
         val_pred_samples=args.val_pred_samples,
-        save_val_predictions=not args.no_save_val_predictions,
+        save_val_predictions=args.save_val_predictions,
         d_model=args.d_model,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
@@ -1293,7 +1282,7 @@ def main():
             device=args.device,
             output_dir=args.output_dir,
             val_pred_samples=args.val_pred_samples,
-            save_val_predictions=not args.no_save_val_predictions,
+            save_val_predictions=args.save_val_predictions,
         )
         print("\nTraining finished.")
         print(json.dumps(info, indent=2))
