@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 """
-LoRa_hf_qwen_lora_server_slim.py
+LoRa_hf_qwen_lora_server_slim_range_loss.py
 
 Server-friendly Hugging Face pretrained LLM + PEFT-LoRA version for
 echo-to-channel prediction.
@@ -10,11 +10,17 @@ Main idea:
     complex echo history -> CNN echo encoder -> inputs_embeds of a pretrained HF LLM
     -> LoRA-adapted attention layers -> regression head -> future Willie channel.
 
-This slim server version saves only the essential files by default:
+This range-loss version saves only the essential files by default:
     output_dir/
         best_model.pt
         train_log.csv
         summary.json
+
+Main modification compared with the slim version:
+    In addition to channel NMSE, the training objective adds a physical-scale
+    log-power / channel-norm loss. This directly constrains the channel
+    amplitude, which is important because the equivalent range is recovered
+    from ||h_w||.
 
 Optional detailed prediction CSV can be enabled with:
     --save_val_predictions
@@ -118,8 +124,18 @@ class EchoLoRAConfig:
     early_stop_min_delta: float = 1e-5
     split_by_order: bool = True  # True: last 20% windows/trajectories as validation.
 
+    # Physical loss weights.
+    # channel_nmse: overall complex channel fitting.
+    # direction: normalized channel-vector fitting, mainly helps angle/phase.
+    # log_power: directly constrains ||h_w||^2 and therefore improves range/path-loss.
+    # temporal: matches the change between adjacent prediction horizons.
+    loss_channel_weight: float = 1.0
+    loss_direction_weight: float = 0.3
+    loss_log_power_weight: float = 1.0
+    loss_temporal_weight: float = 0.05
+
     # Server output.
-    output_dir: str = "runs/hf_qwen_lora_slim"
+    output_dir: str = "runs/hf_qwen_lora_range_loss"
     val_pred_samples: int = 128
     save_val_predictions: bool = False
 
@@ -692,13 +708,102 @@ def channel_nmse_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-
     return torch.mean(num / den)
 
 
+def channel_direction_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Normalized channel-vector loss.
+
+    This mainly constrains the complex channel direction, which is related to
+    phase progression and angle. It is separated from amplitude so that the
+    model does not trade angle fitting against path-loss fitting too freely.
+    """
+    p = pred.reshape(pred.shape[0], pred.shape[1], -1)
+    t = target.reshape(target.shape[0], target.shape[1], -1)
+    p_norm = torch.linalg.vector_norm(p, dim=-1, keepdim=True).clamp_min(eps)
+    t_norm = torch.linalg.vector_norm(t, dim=-1, keepdim=True).clamp_min(eps)
+    p_unit = p / p_norm
+    t_unit = t / t_norm
+    return torch.mean(torch.sum((p_unit - t_unit) ** 2, dim=-1))
+
+
+def channel_log_power_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """
+    Loss on log ||h_w||^2.
+
+    The channel label is h_w = sqrt(L0*r^{-alpha}) a(theta). Therefore
+    ||h_w||^2 is directly linked to range/path loss. This term is the most
+    important addition for reducing range error.
+    """
+    p = pred.reshape(pred.shape[0], pred.shape[1], -1)
+    t = target.reshape(target.shape[0], target.shape[1], -1)
+    p_power = torch.sum(p ** 2, dim=-1).clamp_min(eps)
+    t_power = torch.sum(t ** 2, dim=-1).clamp_min(eps)
+    return torch.mean((torch.log(p_power) - torch.log(t_power)) ** 2)
+
+
+def temporal_delta_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Match the variation trend over prediction horizons."""
+    if pred.shape[1] <= 1:
+        return torch.zeros((), dtype=pred.dtype, device=pred.device)
+    pred_delta = pred[:, 1:] - pred[:, :-1]
+    target_delta = target[:, 1:] - target[:, :-1]
+    return torch.mean((pred_delta - target_delta) ** 2)
+
+
+def inverse_standardize_tensor(x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    return x * std + mean
+
+
+def combined_physical_loss(
+    pred_n: torch.Tensor,
+    target_n: torch.Tensor,
+    y_mean_t: torch.Tensor,
+    y_std_t: torch.Tensor,
+    cfg: EchoLoRAConfig,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Combined loss in physical channel scale.
+
+    The model is trained on standardized Y, but range is recovered from the
+    physical channel norm. Therefore, the loss first maps pred/target back to
+    the real physical real-imag scale and then applies channel, direction,
+    amplitude, and temporal terms.
+    """
+    pred = inverse_standardize_tensor(pred_n, y_mean_t, y_std_t)
+    target = inverse_standardize_tensor(target_n, y_mean_t, y_std_t)
+
+    l_channel = channel_nmse_loss(pred, target, eps=eps)
+    l_direction = channel_direction_loss(pred, target, eps=eps)
+    l_log_power = channel_log_power_loss(pred, target)
+    l_temporal = temporal_delta_loss(pred, target)
+
+    return (
+        cfg.loss_channel_weight * l_channel
+        + cfg.loss_direction_weight * l_direction
+        + cfg.loss_log_power_weight * l_log_power
+        + cfg.loss_temporal_weight * l_temporal
+    )
+
+
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    y_mean_t: Optional[torch.Tensor] = None,
+    y_std_t: Optional[torch.Tensor] = None,
+    cfg: Optional[EchoLoRAConfig] = None,
+) -> float:
     model.eval()
     vals = []
     for xb, yb in loader:
         xb, yb = xb.to(device), yb.to(device)
-        vals.append(float(channel_nmse_loss(model(xb), yb).item()))
+        pred = model(xb)
+        if y_mean_t is not None and y_std_t is not None and cfg is not None:
+            loss = combined_physical_loss(pred, yb, y_mean_t, y_std_t, cfg)
+        else:
+            loss = channel_nmse_loss(pred, yb)
+        vals.append(float(loss.item()))
     return float(np.mean(vals)) if vals else float("nan")
 
 
@@ -939,6 +1044,12 @@ def train_echo_to_channel_lora(
     X_val = x_scaler.transform(X[val_idx])
     Y_val = y_scaler.transform(Y[val_idx])
 
+    # Tensors used to compute the loss in the physical channel scale.
+    # y_scaler.mean/std have shape (1,1,1,2), so they broadcast to
+    # (B,pred_len,L_ris,2).
+    y_mean_t = torch.as_tensor(y_scaler.mean, dtype=torch.float32, device=dev)
+    y_std_t = torch.as_tensor(y_scaler.std, dtype=torch.float32, device=dev)
+
     train_loader = DataLoader(
         EchoChannelDataset(X_train, Y_train),
         batch_size=cfg.batch_size,
@@ -973,6 +1084,13 @@ def train_echo_to_channel_lora(
             "total_params": int(total),
             "trainable_params": int(trainable),
             "trainable_ratio_percent": float(100 * trainable / max(total, 1)),
+        },
+        "loss": {
+            "type": "combined_physical_loss",
+            "channel_weight": cfg.loss_channel_weight,
+            "direction_weight": cfg.loss_direction_weight,
+            "log_power_weight": cfg.loss_log_power_weight,
+            "temporal_weight": cfg.loss_temporal_weight,
         },
         "environment": env_info,
     }
@@ -1021,7 +1139,7 @@ def train_echo_to_channel_lora(
                 xb_model = xb
 
             pred = model(xb_model)
-            raw_loss = channel_nmse_loss(pred, yb)
+            raw_loss = combined_physical_loss(pred, yb, y_mean_t, y_std_t, cfg)
             loss = raw_loss / max(1, int(cfg.grad_accum_steps))
             loss.backward()
 
@@ -1037,7 +1155,7 @@ def train_echo_to_channel_lora(
 
             losses.append(float(raw_loss.item()))
 
-        val = evaluate(model, val_loader, dev)
+        val = evaluate(model, val_loader, dev, y_mean_t, y_std_t, cfg)
         sched.step(val)
         tr = float(np.mean(losses)) if losses else float("nan")
         current_lr = float(opt.param_groups[0]["lr"])
@@ -1064,6 +1182,10 @@ def train_echo_to_channel_lora(
 
         log_row = {
             "epoch": ep,
+            "train_loss": tr,
+            "val_loss": val,
+            "best_val_loss": best_val,
+            # Kept for backward compatibility with previous analysis scripts.
             "train_nmse": tr,
             "val_nmse": val,
             "best_val_nmse": best_val,
@@ -1079,7 +1201,7 @@ def train_echo_to_channel_lora(
         if ep == 1 or ep % 5 == 0 or ep == cfg.epochs or improved:
             print(
                 f"Epoch {ep:04d}/{cfg.epochs} | "
-                f"train_NMSE={tr:.6e} | val_NMSE={val:.6e} | "
+                f"train_loss={tr:.6e} | val_loss={val:.6e} | "
                 f"best={best_val:.6e}@{best_epoch} | lr={current_lr:.2e} | "
                 f"bad={bad_epochs} | sec={epoch_seconds:.1f}"
             )
@@ -1087,7 +1209,7 @@ def train_echo_to_channel_lora(
         if cfg.early_stop_patience > 0 and bad_epochs >= cfg.early_stop_patience:
             print(
                 f"Early stopping at epoch {ep}. "
-                f"Best val_NMSE={best_val:.6e} at epoch {best_epoch}."
+                f"Best val_loss={best_val:.6e} at epoch {best_epoch}."
             )
             break
 
@@ -1197,7 +1319,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
-    parser.add_argument("--output_dir", type=str, default="runs/hf_qwen_lora_slim")
+    parser.add_argument("--output_dir", type=str, default="runs/hf_qwen_lora_range_loss")
     parser.add_argument("--val_pred_samples", type=int, default=128)
     parser.add_argument("--save_val_predictions", action="store_true", help="Optional: export detailed validation predictions CSV.")
     parser.add_argument("--d_model", type=int, default=96)
@@ -1211,6 +1333,10 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=3e-4)
     parser.add_argument("--grad_clip", type=float, default=0.5)
     parser.add_argument("--input_noise_std", type=float, default=0.003)
+    parser.add_argument("--loss_channel_weight", type=float, default=1.0)
+    parser.add_argument("--loss_direction_weight", type=float, default=0.3)
+    parser.add_argument("--loss_log_power_weight", type=float, default=1.0)
+    parser.add_argument("--loss_temporal_weight", type=float, default=0.05)
     parser.add_argument("--early_stop_patience", type=int, default=20)
     parser.add_argument("--early_stop_min_delta", type=float, default=1e-5)
     parser.add_argument("--random_sample_split", action="store_true", help="Use random sample split instead of order/trajectory-like split.")
@@ -1247,6 +1373,10 @@ def main():
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
         input_noise_std=args.input_noise_std,
+        loss_channel_weight=args.loss_channel_weight,
+        loss_direction_weight=args.loss_direction_weight,
+        loss_log_power_weight=args.loss_log_power_weight,
+        loss_temporal_weight=args.loss_temporal_weight,
         early_stop_patience=args.early_stop_patience,
         early_stop_min_delta=args.early_stop_min_delta,
         split_by_order=not args.random_sample_split,
