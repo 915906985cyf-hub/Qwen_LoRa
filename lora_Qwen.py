@@ -5,7 +5,8 @@ lora_Qwen_geo.py
 
 Direct Willie trajectory / geometric-state prediction with Qwen + PEFT-LoRA.
 Output per future slot is [log(range), sin(angle), cos(angle)] instead of full CSI.
-This makes the reported NMSE comparable to range/angle prediction settings.
+For reporting, NMSE is computed on Z=[range, angle] over all future slots,
+matching range/angle-style prediction papers rather than CSI-reconstruction NMSE.
 
 Put in the same folder with:
     lora_Qwen_geo.py
@@ -622,6 +623,29 @@ def angle_sincos_nmse_np(pred_th: np.ndarray, true_th: np.ndarray, eps: float = 
     return float(num / den)
 
 
+def range_angle_z_nmse_np(
+    pred_r: np.ndarray,
+    pred_th: np.ndarray,
+    true_r: np.ndarray,
+    true_th: np.ndarray,
+    eps: float = 1e-12,
+) -> float:
+    """Paper-style NMSE on Z=[range, angle], not on reconstructed CSI.
+
+    Z has shape (..., 2), where the last dimension is [range_m, angle_rad].
+    The predicted angle is first wrapped/aligned around the true angle so that
+    errors across the -pi/pi boundary are not artificially enlarged.
+    """
+    pred_r = np.asarray(pred_r, dtype=np.float64)
+    true_r = np.asarray(true_r, dtype=np.float64)
+    true_th = np.asarray(true_th, dtype=np.float64)
+    pred_th_aligned = true_th + wrap_angle_rad(np.asarray(pred_th, dtype=np.float64) - true_th)
+
+    pred_z = np.stack([pred_r, pred_th_aligned], axis=-1)
+    true_z = np.stack([true_r, true_th], axis=-1)
+    return float(np.sum((pred_z - true_z) ** 2) / (np.sum(true_z ** 2) + eps))
+
+
 def summarize_geometry(pred_geo: np.ndarray, true_geo: np.ndarray, pred_n=None, true_n=None) -> Dict[str, float]:
     pred_r, pred_th = geo_to_range_angle(pred_geo)
     true_r, true_th = geo_to_range_angle(true_geo)
@@ -629,7 +653,10 @@ def summarize_geometry(pred_geo: np.ndarray, true_geo: np.ndarray, pred_n=None, 
     angle_err = np.abs(wrap_angle_rad(pred_th - true_th)) * 180.0 / np.pi
     r_nmse = range_nmse_np(pred_r, true_r)
     a_nmse = angle_sincos_nmse_np(pred_th, true_th)
+    z_nmse = range_angle_z_nmse_np(pred_r, pred_th, true_r, true_th)
     out = {
+        "range_angle_z_nmse": z_nmse,
+        "range_angle_z_nmse_db": nmse_db(z_nmse),
         "range_mae_m": float(np.mean(range_err)),
         "range_median_abs_err_m": float(np.median(range_err)),
         "range_rmse_m": float(np.sqrt(np.mean(range_err ** 2))),
@@ -642,9 +669,11 @@ def summarize_geometry(pred_geo: np.ndarray, true_geo: np.ndarray, pred_n=None, 
         "angle_sincos_nmse_db": nmse_db(a_nmse),
     }
     if pred_n is not None and true_n is not None:
+        # This is the old metric: NMSE on standardized [log(range), sin(angle), cos(angle)].
+        # It is kept only for backward compatibility and should not be reported as CSI NMSE.
         g_nmse = geo_nmse_normalized_np(pred_n, true_n)
-        out["geo_nmse_normalized"] = g_nmse
-        out["geo_nmse_normalized_db"] = nmse_db(g_nmse)
+        out["old_normalized_log_sincos_nmse"] = g_nmse
+        out["old_normalized_log_sincos_nmse_db"] = nmse_db(g_nmse)
     return out
 
 
